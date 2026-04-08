@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import kckfxgen.blas_thread_env  # noqa: F401
+from kckfxgen.cli_log import configure_logging
 
 
 def build_convert_payload(
@@ -27,6 +28,9 @@ def build_convert_payload(
     book_title: str | None,
     book_author: str | None,
     book_publisher: str | None,
+    colorsoft_page_workers: int = 1,
+    rainbow_use_gpu: bool = False,
+    debug: bool = False,
 ) -> dict[str, Any]:
     return {
         "src": str(src.expanduser().resolve()),
@@ -42,11 +46,15 @@ def build_convert_payload(
         "book_title": book_title,
         "book_author": book_author,
         "book_publisher": book_publisher,
+        "colorsoft_page_workers": colorsoft_page_workers,
+        "rainbow_use_gpu": rainbow_use_gpu,
+        "debug": debug,
     }
 
 
 def convert_job_payload(payload: dict[str, Any]) -> tuple[str, str | None]:
     """子进程执行单文件转换。返回 ``(源路径字符串, 错误文本或 None)``。"""
+    configure_logging(debug=bool(payload.get("debug", False)))
     from kckfxgen.pipeline import convert_to_kfx
 
     src = Path(payload["src"])
@@ -59,6 +67,8 @@ def convert_job_payload(payload: dict[str, Any]) -> tuple[str, str | None]:
             split_page_order=payload["split_page_order"],
             rotate_landscape_90=payload["rotate_landscape_90"],
             erase_colorsoft_rainbow=payload["erase_colorsoft_rainbow"],
+            colorsoft_page_workers=int(payload.get("colorsoft_page_workers", 1)),
+            rainbow_use_gpu=bool(payload.get("rainbow_use_gpu", False)),
             page_progression=payload["page_progression"],
             layout_view=payload["layout_view"],
             virtual_panel_axis=payload["virtual_panel_axis"],

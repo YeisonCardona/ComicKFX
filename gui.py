@@ -178,6 +178,17 @@ def _run_conversion(
         log = logging.getLogger(__name__)
         log.info("共 %d 个输入", n)
 
+        page_workers = (
+            min(8, max(1, jobs)) if erase_colorsoft_rainbow else 1
+        )
+        file_workers = max(1, jobs)
+        if n > 1 and erase_colorsoft_rainbow:
+            log.info(
+                "彩虹纹削弱：多文件并行进程数 = %d；单本书内图片并行数 = %d",
+                file_workers,
+                page_workers,
+            )
+
         if n == 1:
             src, kdir = inputs[0], planned[0]
             _, err = kck_main._convert_job(
@@ -194,15 +205,15 @@ def _run_conversion(
                 book_title=book_title,
                 book_author=book_author,
                 book_publisher=book_publisher,
+                colorsoft_page_workers=page_workers,
             )
             if err is not None:
                 err_msg = f"{src.name}: {err}"
             else:
                 ok = True
         else:
-            j = max(1, jobs)
             failed: list[tuple[Path, BaseException]] = []
-            with ProcessPoolExecutor(max_workers=j) as ex:
+            with ProcessPoolExecutor(max_workers=file_workers) as ex:
                 futs = {}
                 for src, kdir in zip(inputs, planned):
                     payload = build_convert_payload(
@@ -219,6 +230,8 @@ def _run_conversion(
                         book_title=book_title,
                         book_author=book_author,
                         book_publisher=book_publisher,
+                        colorsoft_page_workers=page_workers,
+                        debug=debug,
                     )
                     futs[ex.submit(convert_job_payload, payload)] = src
                 for fut in as_completed(futs):

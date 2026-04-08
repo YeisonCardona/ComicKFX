@@ -12,6 +12,7 @@ import sqlite3
 import string
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Literal
 
@@ -22,6 +23,7 @@ from amazon.ion.symbols import SymbolTableCatalog, shared_symbol_table
 from PIL import Image
 
 from .epub_collect import EPUBMetadata
+from .rainbow_artifacts_eraser import gpu_runtime_status
 from .yj_symbols import YJ_CONVERSION_SYMBOLS, YJ_SYMBOLS
 
 logger = logging.getLogger(__name__)
@@ -31,6 +33,47 @@ TOOL_VERSION = "0.1.0"
 
 # 旋转、彩虹纹削弱等路径下 JPEG 必须重编码时使用（Pillow quality 约等于「百分比」；80 兼顾体积与观感）
 JPEG_REENCODE_QUALITY = 80
+# 重编码 PNG 时 zlib 等级（1–9）；9 最小体积（更慢）。勿对 PNG 用 optimize=True，部分版本会反而变大。
+PNG_REENCODE_COMPRESS_LEVEL = 9
+
+_png_quant_dither_none = getattr(getattr(Image, "Dither", None), "NONE", Image.NONE)
+
+
+def _png_for_reencode_after_rainbow(
+    cleaned: Image.Image, source: Image.Image
+) -> Image.Image:
+    """去彩虹后尽量贴近来源 PNG 的存储方式，避免 P→L 再存成真彩导致体积暴涨。"""
+    if source.mode == "P" and source.palette is not None:
+        return cleaned.quantize(palette=source, dither=_png_quant_dither_none)
+    return cleaned
+
+
+def _png_save_kwargs() -> dict:
+    return {
+        "compress_level": PNG_REENCODE_COMPRESS_LEVEL
+        # 不传 optimize：Pillow 对 RGB/L PNG 的 optimize 在不少图上无收益或与 zlib 组合异常
+    }
+
+
+def _jpeg_reencode_kwargs_from_source(im: Image.Image) -> dict:
+    """从重编码前的源图提取 JPEG 保存参数，尽量贴近原图量化与体积。
+
+    解码再编码若固定 quality 且关闭 optimize，常比来源的优化 JPEG 大很多；
+    若源为 JPEG 则优先沿用其 qtables，并开启 optimize 以收紧 Huffman 表。
+    """
+    kwargs: dict = {"optimize": True}
+    qt = getattr(im, "quantization", None)
+    if im.format == "JPEG" and isinstance(qt, dict) and qt:
+        kwargs["qtables"] = qt
+    else:
+        q = im.info.get("quality")
+        if isinstance(q, (int, float)) and 1 <= int(q) <= 95:
+            kwargs["quality"] = int(q)
+        else:
+            kwargs["quality"] = JPEG_REENCODE_QUALITY
+    if im.info.get("progressive"):
+        kwargs["progressive"] = True
+    return kwargs
 
 # sqlite_master.sql 须与 kfxlib 的 kpf_container.py 中单行 DDL 完全一致（Calibre KFX Output 用 set 成员比对）
 _KDF_SCHEMA_SQL = (
@@ -150,38 +193,50 @@ def _rgb_for_jpeg(im: Image.Image) -> Image.Image:
     return im
 
 
+def _png_bytes_to_jpeg_for_kdf(raw: bytes) -> bytes:
+    """内页来源为 PNG 时转 JPEG 再写入 KDF/KFX，显著减小体积（透明区按白底压平）。"""
+    with Image.open(io.BytesIO(raw)) as im:
+        im.load()
+        jkw = _jpeg_reencode_kwargs_from_source(im)
+        buf = io.BytesIO()
+        _rgb_for_jpeg(im).save(buf, format="JPEG", **jkw)
+    return buf.getvalue()
+
+
 def _encode_rotated_raster(raw: bytes, ion_fmt: str) -> tuple[bytes, int, int]:
     """解码后逆时针 90°，再按 ion_fmt（jpg/png）编码（旋转无法避免重编码）。"""
     with Image.open(io.BytesIO(raw)) as im:
         im.load()
+        jpg_kw = _jpeg_reencode_kwargs_from_source(im) if ion_fmt == "jpg" else {}
         rotated = _transpose_rotate_90_ccw(im).copy()
     w, h = rotated.size
     buf = io.BytesIO()
     if ion_fmt == "jpg":
-        _rgb_for_jpeg(rotated).save(
-            buf, format="JPEG", quality=JPEG_REENCODE_QUALITY, optimize=False
-        )
+        _rgb_for_jpeg(rotated).save(buf, format="JPEG", **jpg_kw)
     else:
-        rotated.save(buf, format="PNG", compress_level=3)
+        rotated.save(buf, format="PNG", **_png_save_kwargs())
     return buf.getvalue(), w, h
 
 
-def _apply_colorsoft_rainbow_erase_bytes(raw: bytes, ion_fmt: str) -> tuple[bytes, int, int]:
+def _apply_colorsoft_rainbow_erase_bytes(
+    raw: bytes, ion_fmt: str, *, use_gpu: bool = False
+) -> tuple[bytes, int, int]:
     """对 JPEG/PNG 字节流做 Colorsoft 彩虹纹削弱（频域滤波），并重编码为同格式。"""
     from .rainbow_artifacts_eraser import erase_rainbow_artifacts
 
     with Image.open(io.BytesIO(raw)) as im:
         im.load()
+        jpg_kw = _jpeg_reencode_kwargs_from_source(im) if ion_fmt == "jpg" else {}
         is_color = im.mode in ("RGB", "RGBA")
-        cleaned = erase_rainbow_artifacts(im, is_color)
+        cleaned = erase_rainbow_artifacts(im, is_color, use_gpu=use_gpu)
+        if ion_fmt == "png":
+            cleaned = _png_for_reencode_after_rainbow(cleaned, im)
     w, h = cleaned.size
     buf = io.BytesIO()
     if ion_fmt == "jpg":
-        _rgb_for_jpeg(cleaned).save(
-            buf, format="JPEG", quality=JPEG_REENCODE_QUALITY, optimize=False
-        )
+        _rgb_for_jpeg(cleaned).save(buf, format="JPEG", **jpg_kw)
     elif ion_fmt == "png":
-        cleaned.save(buf, format="PNG", compress_level=3)
+        cleaned.save(buf, format="PNG", **_png_save_kwargs())
     else:
         raise ValueError(f"彩虹纹削弱仅支持 jpg/png 重编码，当前: {ion_fmt!r}")
     return buf.getvalue(), w, h
@@ -192,12 +247,17 @@ def _load_page_raster_for_kdf(
     *,
     rotate_landscape_90: bool,
     erase_colorsoft_rainbow: bool,
+    rainbow_use_gpu: bool = False,
 ) -> tuple[bytes, str, int, int]:
     image_bytes, ion_fmt, im_width, im_height = _read_raster_passthrough(image_path)
+    if ion_fmt == "png":
+        logger.debug("[kdf] 内嵌 KFX：PNG→JPEG %s", image_path.name)
+        image_bytes = _png_bytes_to_jpeg_for_kdf(image_bytes)
+        ion_fmt = "jpg"
     if erase_colorsoft_rainbow:
         logger.debug("[kdf] Colorsoft 彩虹纹削弱: %s", image_path.name)
         image_bytes, im_width, im_height = _apply_colorsoft_rainbow_erase_bytes(
-            image_bytes, ion_fmt
+            image_bytes, ion_fmt, use_gpu=rainbow_use_gpu
         )
     if rotate_landscape_90 and im_width > im_height:
         image_bytes, im_width, im_height = _encode_rotated_raster(image_bytes, ion_fmt)
@@ -208,6 +268,20 @@ def _load_page_raster_for_kdf(
             im_height,
         )
     return image_bytes, ion_fmt, im_width, im_height
+
+
+def _parallel_colorsoft_raster_row(
+    task: tuple[int, Path, bool, bool],
+) -> tuple[int, bytes, str, int, int]:
+    """供 ``ThreadPoolExecutor``：按索引并行做彩虹纹削弱 + 可选旋转（须在 BLAS 单线程环境下）。"""
+    _idx, image_path, rotate_landscape_90, rainbow_use_gpu = task
+    b, fmt, w, h = _load_page_raster_for_kdf(
+        image_path,
+        rotate_landscape_90=rotate_landscape_90,
+        erase_colorsoft_rainbow=True,
+        rainbow_use_gpu=rainbow_use_gpu,
+    )
+    return _idx, b, fmt, w, h
 
 
 class ImageKdfWriter:
@@ -236,6 +310,8 @@ class ImageKdfWriter:
         cover_from_first_portrait: bool = False,
         rotate_landscape_90: bool = False,
         erase_colorsoft_rainbow: bool = False,
+        colorsoft_page_workers: int = 1,
+        rainbow_use_gpu: bool = False,
         page_progression: Literal["ltr", "rtl"] = "ltr",
         layout_view: Literal["fixed", "virtual"] = "fixed",
         virtual_panel_axis: Literal["vertical", "horizontal"] = "vertical",
@@ -249,7 +325,9 @@ class ImageKdfWriter:
             else 0
         )
         logger.debug(
-            "[kdf] 初始化 KDF: db=%s res_dir=%s 图片数=%d cover_idx=%d portrait=%s rotate_landscape_90=%s erase_colorsoft_rainbow=%s page_progression=%s layout_view=%s virtual_panel_axis=%s",
+            "[kdf] 初始化 KDF: db=%s res_dir=%s 图片数=%d cover_idx=%d portrait=%s "
+            "rotate_landscape_90=%s erase_colorsoft_rainbow=%s colorsoft_page_workers=%s "
+            "rainbow_use_gpu=%s page_progression=%s layout_view=%s virtual_panel_axis=%s",
             db_path,
             self.res_dir,
             len(image_paths),
@@ -257,6 +335,8 @@ class ImageKdfWriter:
             cover_from_first_portrait,
             rotate_landscape_90,
             erase_colorsoft_rainbow,
+            colorsoft_page_workers,
+            rainbow_use_gpu,
             page_progression,
             layout_view,
             virtual_panel_axis,
@@ -288,13 +368,56 @@ class ImageKdfWriter:
                 first_cover_res = ""
                 authoring_aux_ids: list[str] = []
 
+                use_parallel_colorsoft = (
+                    erase_colorsoft_rainbow
+                    and colorsoft_page_workers > 1
+                    and len(image_paths) > 0
+                )
+                preloaded_rasters: list[tuple[bytes, str, int, int] | None]
+                if use_parallel_colorsoft:
+                    wn = min(max(1, colorsoft_page_workers), len(image_paths))
+                    logger.debug(
+                        "[kdf] 彩虹纹削弱：%d 线程并行预处理 %d 页（GPU=%s）",
+                        wn,
+                        len(image_paths),
+                        "on" if rainbow_use_gpu else "off",
+                    )
+                    tasks = [
+                        (i, image_paths[i], rotate_landscape_90, rainbow_use_gpu)
+                        for i in range(len(image_paths))
+                    ]
+                    with ThreadPoolExecutor(max_workers=wn) as ex:
+                        rows = list(ex.map(_parallel_colorsoft_raster_row, tasks))
+                    preloaded_rasters = [(r[1], r[2], r[3], r[4]) for r in rows]
+                else:
+                    preloaded_rasters = [None] * len(image_paths)
+
+                total_pages = len(image_paths)
+                # 页进度日志：小书逐页，大书按约 5% 粒度汇报
+                progress_stride = 1 if total_pages <= 120 else max(1, total_pages // 20)
+                if erase_colorsoft_rainbow:
+                    if rainbow_use_gpu:
+                        logger.info("[kdf] 彩虹纹流程 GPU 模式: %s", gpu_runtime_status())
+                    else:
+                        logger.info("[kdf] 彩虹纹流程 GPU 模式: off（按参数使用 CPU）")
+
                 for idx, img_path in enumerate(image_paths):
+                    page_no = idx + 1
+                    if page_no == 1 or page_no == total_pages or (page_no % progress_stride == 0):
+                        logger.info(
+                            "[kdf] 单书进度 %d/%d (%.1f%%) - %s",
+                            page_no,
+                            total_pages,
+                            (page_no * 100.0) / max(1, total_pages),
+                            img_path.name,
+                        )
                     logger.debug(
                         "[kdf] 写入固定版式页 [%d/%d]: section+resource <- %s",
-                        idx + 1,
+                        page_no,
                         len(image_paths),
                         img_path,
                     )
+                    pr = preloaded_rasters[idx] if use_parallel_colorsoft else None
                     if layout_view == "virtual":
                         section_id, spm_list, res_id, aux_id = (
                             self._add_virtual_panel_image_section(
@@ -302,6 +425,8 @@ class ImageKdfWriter:
                                 rotate_landscape_90=rotate_landscape_90,
                                 erase_colorsoft_rainbow=erase_colorsoft_rainbow,
                                 virtual_panel_axis=virtual_panel_axis,
+                                preloaded_raster=pr,
+                                rainbow_use_gpu=rainbow_use_gpu,
                             )
                         )
                         authoring_aux_ids.append(aux_id)
@@ -310,6 +435,8 @@ class ImageKdfWriter:
                             img_path,
                             rotate_landscape_90=rotate_landscape_90,
                             erase_colorsoft_rainbow=erase_colorsoft_rainbow,
+                            preloaded_raster=pr,
+                            rainbow_use_gpu=rainbow_use_gpu,
                         )
                     section_ids.append(section_id)
                     all_structure_ids[section_id] = spm_list
@@ -556,14 +683,20 @@ class ImageKdfWriter:
         rotate_landscape_90: bool = False,
         erase_colorsoft_rainbow: bool = False,
         virtual_panel_axis: Literal["vertical", "horizontal"] = "vertical",
+        preloaded_raster: tuple[bytes, str, int, int] | None = None,
+        rainbow_use_gpu: bool = False,
     ) -> tuple[str, list[tuple[str, int]], str, str]:
         """虚拟视图（对齐 Kindle Create）：页模板 ``virtual_panel: enabled``、SPM 三槽、中层 ``layout: vertical|horizontal``。"""
         assert self.res_dir is not None
-        image_bytes, ion_fmt, im_width, im_height = _load_page_raster_for_kdf(
-            image_path,
-            rotate_landscape_90=rotate_landscape_90,
-            erase_colorsoft_rainbow=erase_colorsoft_rainbow,
-        )
+        if preloaded_raster is not None:
+            image_bytes, ion_fmt, im_width, im_height = preloaded_raster
+        else:
+            image_bytes, ion_fmt, im_width, im_height = _load_page_raster_for_kdf(
+                image_path,
+                rotate_landscape_90=rotate_landscape_90,
+                erase_colorsoft_rainbow=erase_colorsoft_rainbow,
+                rainbow_use_gpu=rainbow_use_gpu,
+            )
 
         axis_ion = (
             "vertical" if virtual_panel_axis == "vertical" else "horizontal"
@@ -723,13 +856,19 @@ class ImageKdfWriter:
         *,
         rotate_landscape_90: bool = False,
         erase_colorsoft_rainbow: bool = False,
+        preloaded_raster: tuple[bytes, str, int, int] | None = None,
+        rainbow_use_gpu: bool = False,
     ) -> tuple[str, list[tuple[str, int]], str]:
         assert self.res_dir is not None
-        image_bytes, ion_fmt, im_width, im_height = _load_page_raster_for_kdf(
-            image_path,
-            rotate_landscape_90=rotate_landscape_90,
-            erase_colorsoft_rainbow=erase_colorsoft_rainbow,
-        )
+        if preloaded_raster is not None:
+            image_bytes, ion_fmt, im_width, im_height = preloaded_raster
+        else:
+            image_bytes, ion_fmt, im_width, im_height = _load_page_raster_for_kdf(
+                image_path,
+                rotate_landscape_90=rotate_landscape_90,
+                erase_colorsoft_rainbow=erase_colorsoft_rainbow,
+                rainbow_use_gpu=rainbow_use_gpu,
+            )
 
         section_id = self.create_fragment_id("c")
         section_struct_id = self.create_fragment_id("i")

@@ -97,6 +97,8 @@ def _convert_job(
     book_title: str | None,
     book_author: str | None,
     book_publisher: str | None,
+    colorsoft_page_workers: int = 1,
+    rainbow_use_gpu: bool = False,
 ) -> tuple[Path, BaseException | None]:
     try:
         convert_to_kfx(
@@ -106,6 +108,8 @@ def _convert_job(
             split_page_order=split_page_order,
             rotate_landscape_90=rotate_landscape_90,
             erase_colorsoft_rainbow=erase_colorsoft_rainbow,
+            colorsoft_page_workers=colorsoft_page_workers,
+            rainbow_use_gpu=rainbow_use_gpu,
             page_progression=page_progression,
             layout_view=layout_view,
             virtual_panel_axis=virtual_panel_axis,
@@ -141,7 +145,8 @@ def main() -> None:
         description=(
             "输入单个 EPUB / 漫画压缩包（.zip .cbz .rar .cbr），或包含上述文件的目录（递归），"
             "生成 KFX（内置 kfxlib：KPF → KfxContainer，无 Kindle Previewer）。"
-            "多文件时使用线程池并发。"
+            "多文件时默认用多进程并行；若启用 --erase-colorsoft-rainbow，则多文件串行，"
+            "-j 改为单本书内多页并行。"
         )
     )
     parser.add_argument(
@@ -169,7 +174,10 @@ def main() -> None:
         type=int,
         default=max(1, min(2, os.cpu_count() or 4)),
         metavar="N",
-        help="多文件并行时的进程数（每本书独立进程，避免 NumPy 多线程崩溃；默认: min(2, CPU)）",
+        help=(
+            "多文件并行进程数（默认 min(2, CPU)）。"
+            "启用彩虹纹削弱时，单本书内页处理固定使用 8 线程并行。"
+        ),
     )
     parser.add_argument(
         "-d",
@@ -200,6 +208,11 @@ def main() -> None:
             "削弱 Kindle Colorsoft 等设备上的彩虹摩尔纹：对每页 JPEG/PNG 做频域定向衰减"
             "（算法来自 KCC rainbow_artifacts_eraser；需 numpy，会重编码，耗时显著增加）"
         ),
+    )
+    parser.add_argument(
+        "--use-gpu",
+        action="store_true",
+        help="仅与 --erase-colorsoft-rainbow 配合：优先使用 CuPy/GPU 做彩虹纹处理（失败自动回退 CPU）",
     )
     parser.add_argument(
         "--page-progression",
@@ -274,6 +287,11 @@ def main() -> None:
     for d in {p for p in planned}:
         d.mkdir(parents=True, exist_ok=True)
 
+    page_workers = (
+        8 if args.erase_colorsoft_rainbow else 1
+    )
+    file_workers = max(1, args.jobs)
+
     meta_override = any(
         x is not None for x in (args.title, args.author, args.publisher)
     )
@@ -288,9 +306,20 @@ def main() -> None:
 
     print_run_header(
         input_count=n,
-        jobs=max(1, args.jobs) if n > 1 else None,
+        jobs=file_workers if n > 1 else None,
         debug=args.debug,
     )
+    if n > 1 and args.erase_colorsoft_rainbow:
+        logger.info(
+            "已启用彩虹纹削弱：多输入并行进程数 = %d（-j）；单本书内图片并行数 = %d",
+            file_workers,
+            page_workers,
+        )
+    if args.erase_colorsoft_rainbow:
+        logger.info(
+            "彩虹纹 GPU 参数：%s",
+            "on（若 CuPy/CUDA 不可用将自动回退 CPU）" if args.use_gpu else "off（CPU）",
+        )
 
     if n == 1:
         src, kdir = inputs[0], planned[0]
@@ -309,6 +338,9 @@ def main() -> None:
                 book_title=args.title,
                 book_author=args.author,
                 book_publisher=args.publisher,
+                colorsoft_page_workers=page_workers,
+                rainbow_use_gpu=args.use_gpu,
+                debug=args.debug,
             )
         except KeyboardInterrupt:
             logger.warning("已中断（Ctrl+C 或终止信号）")
@@ -318,11 +350,10 @@ def main() -> None:
             sys.exit(1)
         return
 
-    jobs = max(1, args.jobs)
     failed: list[tuple[Path, BaseException]] = []
     interrupted = False
-    # 多文件用进程池：避免 Windows 上多线程 + NumPy/BLAS 原生闪退（线程池隔离不足）
-    ex = ProcessPoolExecutor(max_workers=jobs)
+    # 多文件用进程池：按 -j 控制并行进程数；去彩虹时单书内页并行同样受 -j 约束（最多 8）
+    ex = ProcessPoolExecutor(max_workers=file_workers)
     try:
         futs = {}
         for src, kdir in zip(inputs, planned):
@@ -340,6 +371,9 @@ def main() -> None:
                 book_title=args.title,
                 book_author=args.author,
                 book_publisher=args.publisher,
+                colorsoft_page_workers=page_workers,
+                rainbow_use_gpu=args.use_gpu,
+                debug=args.debug,
             )
             futs[ex.submit(convert_job_payload, payload)] = src
         for fut in as_completed(futs):
