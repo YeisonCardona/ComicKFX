@@ -464,6 +464,7 @@ def convert_to_kfx(
     layout_view: Literal["fixed", "virtual"] = "fixed",
     virtual_panel_axis: Literal["vertical", "horizontal"] = "vertical",
     page_spread_previews: bool = False,
+    cde_content_type: Literal["PDOC", "EBOOK"] = "PDOC",
     keep_kpf: bool = False,
     book_title: str | None = None,
     book_author: str | None = None,
@@ -532,7 +533,7 @@ def convert_to_kfx(
         logger.debug("中间 KPF: %s", tmp_kpf)
         if not _cli_verbose():
             logger.info("KPF → KFX（kfxlib / KfxContainer）…")
-        kpf_path_to_kfx_file(tmp_kpf, out_kfx, cde_pdoc=False)
+        kpf_path_to_kfx_file(tmp_kpf, out_kfx, cde_pdoc=(cde_content_type == "PDOC"))
         if keep_kpf:
             kpf_dest = out_kfx.with_suffix(".kpf")
             shutil.copy2(tmp_kpf, kpf_dest)
@@ -567,6 +568,7 @@ def convert_epub_to_kfx(
     layout_view: Literal["fixed", "virtual"] = "fixed",
     virtual_panel_axis: Literal["vertical", "horizontal"] = "vertical",
     page_spread_previews: bool = False,
+    cde_content_type: Literal["PDOC", "EBOOK"] = "PDOC",
     keep_kpf: bool = False,
     book_title: str | None = None,
     book_author: str | None = None,
@@ -586,6 +588,7 @@ def convert_epub_to_kfx(
         layout_view=layout_view,
         virtual_panel_axis=virtual_panel_axis,
         page_spread_previews=page_spread_previews,
+        cde_content_type=cde_content_type,
         keep_kpf=keep_kpf,
         book_title=book_title,
         book_author=book_author,
