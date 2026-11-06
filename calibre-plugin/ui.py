@@ -17,33 +17,60 @@ from qt.core import (
     QButtonGroup,
     QIcon,
     QPixmap,
+    QGroupBox,
 )
 
 
-class ComicKFXDialog(QDialog):
+class GenerateComicKFXDialog(QDialog):
 
     def __init__(self, text, parent=None):
         super().__init__(parent)
 
-        self.setWindowTitle("Comic KFX")
+        self.setWindowTitle("Generate Comic KFX")
 
         layout = QVBoxLayout(self)
 
         layout.addWidget(QLabel(text))
 
-        self.group = QButtonGroup(self)
+        # Read direction
+        direction_box = QGroupBox("Read direction:")
+        direction_layout = QVBoxLayout(direction_box)
+
+        self.direction_group = QButtonGroup(self)
 
         self.rtl = QRadioButton("RTL (Right to Left, Asian comics)")
         self.rtl.setChecked(True)
 
         self.ltr = QRadioButton("LTR (Left to Right, Western comics)")
 
-        self.group.addButton(self.rtl)
-        self.group.addButton(self.ltr)
+        self.direction_group.addButton(self.rtl)
+        self.direction_group.addButton(self.ltr)
 
-        layout.addWidget(self.rtl)
-        layout.addWidget(self.ltr)
+        direction_layout.addWidget(self.rtl)
+        direction_layout.addWidget(self.ltr)
 
+        layout.addWidget(direction_box)
+
+        # Content type
+        content_box = QGroupBox("Content type:")
+        content_layout = QVBoxLayout(content_box)
+
+        self.content_group = QButtonGroup(self)
+
+        self.pdoc = QRadioButton("PDOC (Displayed in Kindle Documents)")
+
+        self.ebook = QRadioButton("EBOOK (Displayed in Kindle Books)")
+        self.ebook.setChecked(True)
+
+        self.content_group.addButton(self.ebook)
+        self.content_group.addButton(self.pdoc)
+
+        content_layout.addWidget(self.ebook)
+        content_layout.addWidget(self.pdoc)
+
+        layout.addWidget(content_box)
+
+        # Dialog buttons
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -54,12 +81,12 @@ class ComicKFXDialog(QDialog):
         layout.addWidget(buttons)
 
 
-class ComicKFX(InterfaceAction):
+class GenerateComicKFX(InterfaceAction):
 
-    name = "Comic KFX"
+    name = "Generate Comic KFX"
 
     action_spec = (
-        "Comic KFX",
+        "Generate Comic KFX",
         None,
         "Generate optimized KFX for comics",
         None,
@@ -69,7 +96,7 @@ class ComicKFX(InterfaceAction):
         plugin_dir = os.path.dirname(os.path.abspath(__file__))
 
         # Si estamos en desarrollo por symlink o carpeta directa
-        target_lib_dir = os.path.join(plugin_dir, "_manga_kfx_libs")
+        target_lib_dir = os.path.join(plugin_dir, "_comic_kfx_libs")
         real_lib_path = os.path.join(target_lib_dir, "lib")
 
         # Si la carpeta lib local de desarrollo existe, la usamos directamente
@@ -78,7 +105,7 @@ class ComicKFX(InterfaceAction):
             if ".zip" in plugin_dir:
                 zip_path = plugin_dir.split(".zip")[0] + ".zip"
                 plugins_dir = os.path.dirname(zip_path)
-                target_lib_dir = os.path.join(plugins_dir, "_manga_kfx_libs")
+                target_lib_dir = os.path.join(plugins_dir, "_comic_kfx_libs")
                 real_lib_path = os.path.join(target_lib_dir, "lib")
                 if not os.path.exists(real_lib_path):
                     os.makedirs(target_lib_dir, exist_ok=True)
@@ -108,7 +135,9 @@ class ComicKFX(InterfaceAction):
         rows = self.gui.library_view.selectionModel().selectedRows()
 
         if not rows:
-            info_dialog(self.gui, "Comic KFX", "Select a book first.", show=True)
+            info_dialog(
+                self.gui, "Generate Comic KFX", "Select a book first.", show=True
+            )
             return
 
         # Obtener IDs internos
@@ -145,18 +174,20 @@ class ComicKFX(InterfaceAction):
         if missinng:
             info_dialog(
                 self.gui,
-                "Comic KFX",
+                "Generate Comic KFX",
                 f"Missing CBZ for\n{'\n'.join(missinng)}",
                 show=True,
             )
 
-        dialog = ComicKFXDialog(
-            f"The following titles will be converted into optimized KFX comic files:\n\n{'\n'.join([Path(file).name for file in cbz])}\n\nSelect the reading direction:",
+        dialog = GenerateComicKFXDialog(
+            f"The following titles will be converted into optimized KFX comic files:\n\n{'\n'.join([Path(file).name for file in cbz])}\n\n",
             self.gui,
         )
 
         if dialog.exec() == QDialog.DialogCode.Accepted:
             reading_order = "RTL" if dialog.rtl.isChecked() else "LTR"
+            content_type = "PDOC" if self.pdoc.isChecked() else "EBOOK"
+
             if reading_order == "RTL":
                 page_progression = "rtl"
                 split_page_order = "right-left"
@@ -175,6 +206,7 @@ class ComicKFX(InterfaceAction):
                         page_progression=page_progression,
                         split_page_order=split_page_order,
                         page_spread_previews=True,
+                        content_type=content_type,
                         layout_view="virtual",
                     )
 
@@ -187,7 +219,7 @@ class ComicKFX(InterfaceAction):
 
             info_dialog(
                 self.gui,
-                "Comic KFX",
+                "Generate Comic KFX",
                 "All KFX files have been generated successfully.",
                 show=True,
             )
