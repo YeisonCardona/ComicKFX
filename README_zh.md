@@ -122,6 +122,7 @@ python main.py 路径/漫画.epub -d
 - **`page_progression`**：`"ltr"`（默认）或 `"rtl"`
 - **`layout_view`**：`"fixed"`（默认）或 `"virtual"`
 - **`virtual_panel_axis`**：`"vertical"`（默认）或 `"horizontal"`（在 `layout_view="virtual"` 时生效）
+- **`page_spread_previews`**：设为 `True` 时，将封面之后的横向页面切成两个有序图像，并在 KDF 中以 `page_spread` section 配对（裁切图只写入临时工作目录）
 - **`keep_kpf`**：设为 `True` 时在输出 **`.kfx` 同目录** 保留同名 **`.kpf`**
 
 从**项目根目录**执行上述命令。

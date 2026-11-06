@@ -3,7 +3,7 @@
 """从 EPUB 或漫画压缩包（ZIP/CBZ、RAR/CBR）生成 KPF，再经本包 ``kckfxgen.kfxlib`` 打包为单文件 KFX。
 
 生成的 book.kdf 中 book_metadata 含 kindle_capability_metadata（yj_fixed_layout、
-yj_publisher_panels），便于 Kindle 侧识别固定版式漫画；``cde_content_type`` 为 **PDOC**（个人文档），非商店图书 (EBOK)。
+yj_publisher_panels；有 page_spread 时再含 yj_double_page_spread），便于 Kindle 侧识别固定版式漫画；``cde_content_type`` 为 **PDOC**（个人文档），非商店图书 (EBOK)。
 
 对外主流程为 ``convert_to_kfx``（``convert_epub_to_kfx`` 为兼容别名）：
 临时 .kpf → ``kpf_to_kfx.kpf_path_to_kfx_file``（``cde_pdoc=True`` / ``KfxContainer.serialize``）→ 目标目录中的 ``书名-作者.kfx``（重名时 ``_2``、``_3`` 后缀）。
@@ -34,7 +34,12 @@ from .epub_collect import (
     get_epub_metadata,
     metadata_from_comic_archive_stem,
 )
-from .kdf_writer import TOOL_NAME, TOOL_VERSION, ImageKdfWriter
+from .kdf_writer import (
+    TOOL_NAME,
+    TOOL_VERSION,
+    ImageKdfWriter,
+    _first_portrait_cover_index,
+)
 from .kpf_to_kfx import kpf_path_to_kfx_file
 
 logger = logging.getLogger(__name__)
@@ -195,6 +200,7 @@ def _images_to_kpf_zip(
     page_progression: Literal["ltr", "rtl"] = "ltr",
     layout_view: Literal["fixed", "virtual"] = "fixed",
     virtual_panel_axis: Literal["vertical", "horizontal"] = "vertical",
+    page_spread_previews: bool = False,
 ) -> None:
     """在已存在的 ``tmp_path`` 工作目录内生成 KPF 目录树并打包为 ``dest``（.kpf ZIP）。
 
@@ -204,10 +210,27 @@ def _images_to_kpf_zip(
     ``colorsoft_page_workers>1`` 且启用彩虹纹削弱时，在单本书内用多线程并行预处理各页（依赖 ``blas_thread_env`` 将 BLAS 限为单线程）。
     ``layout_view=virtual`` 时生成与 Kindle Create 虚拟面板相近的 KDF（``virtual_panel: enabled``、yj.authoring 链等）。
     """
-    if split_spreads:
+    spread_pair_starts: set[int] = set()
+    cover_index = (
+        _first_portrait_cover_index(images, rotate_landscape_90=rotate_landscape_90)
+        if portrait_cover
+        else 0
+    )
+    if page_spread_previews:
+        from .spread_split import expand_landscape_pages_for_kdf
+
+        images, spread_pair_starts, cover_index = expand_landscape_pages_for_kdf(
+            images,
+            tmp_path / "_kckfxgen_facing_pages",
+            page_order=split_page_order,
+            cover_index=cover_index,
+        )
+    elif split_spreads:
         from .spread_split import expand_spread_pages
 
-        logger.debug("环节: 双页裁切（空白中缝检测 + 正中切，顺序=%s）", split_page_order)
+        logger.debug(
+            "环节: 双页裁切（空白中缝检测 + 正中切，顺序=%s）", split_page_order
+        )
         split_dir = tmp_path / "_kckfxgen_split"
         images = expand_spread_pages(
             images,
@@ -242,6 +265,8 @@ def _images_to_kpf_zip(
         page_progression=page_progression,
         layout_view=layout_view,
         virtual_panel_axis=virtual_panel_axis,
+        spread_pair_starts=spread_pair_starts,
+        cover_index=cover_index if page_spread_previews else None,
     )
     _write_kcb(
         kpf_dir,
@@ -275,6 +300,7 @@ def epub_to_kpf(
     page_progression: Literal["ltr", "rtl"] = "ltr",
     layout_view: Literal["fixed", "virtual"] = "fixed",
     virtual_panel_axis: Literal["vertical", "horizontal"] = "vertical",
+    page_spread_previews: bool = False,
     book_title: str | None = None,
     book_author: str | None = None,
     book_publisher: str | None = None,
@@ -336,6 +362,7 @@ def epub_to_kpf(
             page_progression=page_progression,
             layout_view=layout_view,
             virtual_panel_axis=virtual_panel_axis,
+            page_spread_previews=page_spread_previews,
         )
 
     logger.debug("环节: 临时目录已清理，流程结束")
@@ -355,6 +382,7 @@ def comic_archive_to_kpf(
     page_progression: Literal["ltr", "rtl"] = "ltr",
     layout_view: Literal["fixed", "virtual"] = "fixed",
     virtual_panel_axis: Literal["vertical", "horizontal"] = "vertical",
+    page_spread_previews: bool = False,
     book_title: str | None = None,
     book_author: str | None = None,
     book_publisher: str | None = None,
@@ -415,6 +443,7 @@ def comic_archive_to_kpf(
             page_progression=page_progression,
             layout_view=layout_view,
             virtual_panel_axis=virtual_panel_axis,
+            page_spread_previews=page_spread_previews,
         )
 
     logger.debug("环节: 漫画包临时目录已清理")
@@ -434,6 +463,7 @@ def convert_to_kfx(
     page_progression: Literal["ltr", "rtl"] = "ltr",
     layout_view: Literal["fixed", "virtual"] = "fixed",
     virtual_panel_axis: Literal["vertical", "horizontal"] = "vertical",
+    page_spread_previews: bool = False,
     keep_kpf: bool = False,
     book_title: str | None = None,
     book_author: str | None = None,
@@ -471,6 +501,7 @@ def convert_to_kfx(
                 page_progression=page_progression,
                 layout_view=layout_view,
                 virtual_panel_axis=virtual_panel_axis,
+                page_spread_previews=page_spread_previews,
                 book_title=book_title,
                 book_author=book_author,
                 book_publisher=book_publisher,
@@ -488,6 +519,7 @@ def convert_to_kfx(
                 page_progression=page_progression,
                 layout_view=layout_view,
                 virtual_panel_axis=virtual_panel_axis,
+                page_spread_previews=page_spread_previews,
                 book_title=book_title,
                 book_author=book_author,
                 book_publisher=book_publisher,
@@ -500,7 +532,7 @@ def convert_to_kfx(
         logger.debug("中间 KPF: %s", tmp_kpf)
         if not _cli_verbose():
             logger.info("KPF → KFX（kfxlib / KfxContainer）…")
-        kpf_path_to_kfx_file(tmp_kpf, out_kfx, cde_pdoc=True)
+        kpf_path_to_kfx_file(tmp_kpf, out_kfx, cde_pdoc=False)
         if keep_kpf:
             kpf_dest = out_kfx.with_suffix(".kpf")
             shutil.copy2(tmp_kpf, kpf_dest)
@@ -534,6 +566,7 @@ def convert_epub_to_kfx(
     page_progression: Literal["ltr", "rtl"] = "ltr",
     layout_view: Literal["fixed", "virtual"] = "fixed",
     virtual_panel_axis: Literal["vertical", "horizontal"] = "vertical",
+    page_spread_previews: bool = False,
     keep_kpf: bool = False,
     book_title: str | None = None,
     book_author: str | None = None,
@@ -552,6 +585,7 @@ def convert_epub_to_kfx(
         page_progression=page_progression,
         layout_view=layout_view,
         virtual_panel_axis=virtual_panel_axis,
+        page_spread_previews=page_spread_previews,
         keep_kpf=keep_kpf,
         book_title=book_title,
         book_author=book_author,

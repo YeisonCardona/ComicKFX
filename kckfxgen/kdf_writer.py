@@ -35,6 +35,7 @@ TOOL_VERSION = "0.1.0"
 JPEG_REENCODE_QUALITY = 80
 # 重编码 PNG 时 zlib 等级（1–9）；9 最小体积（更慢）。勿对 PNG 用 optimize=True，部分版本会反而变大。
 PNG_REENCODE_COMPRESS_LEVEL = 9
+PAGE_THUMBNAIL_SIZE = (270, 384)
 
 _png_quant_dither_none = getattr(getattr(Image, "Dither", None), "NONE", Image.NONE)
 
@@ -53,6 +54,29 @@ def _png_save_kwargs() -> dict:
         "compress_level": PNG_REENCODE_COMPRESS_LEVEL
         # 不传 optimize：Pillow 对 RGB/L PNG 的 optimize 在不少图上无收益或与 zlib 组合异常
     }
+
+
+def _make_page_thumbnail(image_bytes: bytes) -> tuple[bytes, int, int] | None:
+    """Make the small JPEG preview referenced by a KFX page resource."""
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as source:
+            thumbnail = source.copy()
+        thumbnail.thumbnail(PAGE_THUMBNAIL_SIZE, Image.Resampling.LANCZOS)
+        if thumbnail.mode not in ("L", "RGB"):
+            if "A" in thumbnail.getbands():
+                rgba = thumbnail.convert("RGBA")
+                background = Image.new("RGB", rgba.size, "white")
+                background.paste(rgba, mask=rgba.getchannel("A"))
+                thumbnail = background
+            else:
+                thumbnail = thumbnail.convert("RGB")
+        width, height = thumbnail.size
+        output = io.BytesIO()
+        thumbnail.save(output, format="JPEG", quality=82, optimize=True)
+        return output.getvalue(), width, height
+    except (OSError, ValueError):
+        logger.warning("No se pudo crear la miniatura KFX para una página.")
+        return None
 
 
 def _jpeg_reencode_kwargs_from_source(im: Image.Image) -> dict:
@@ -307,6 +331,8 @@ class ImageKdfWriter:
         db_path: Path,
         image_paths: list[Path],
         *,
+        spread_pair_starts: set[int] | None = None,
+        cover_index: int | None = None,
         cover_from_first_portrait: bool = False,
         rotate_landscape_90: bool = False,
         erase_colorsoft_rainbow: bool = False,
@@ -317,7 +343,7 @@ class ImageKdfWriter:
         virtual_panel_axis: Literal["vertical", "horizontal"] = "vertical",
     ) -> None:
         self.res_dir = db_path.parent / "res"
-        cover_idx = (
+        cover_idx = cover_index if cover_index is not None else (
             _first_portrait_cover_index(
                 image_paths, rotate_landscape_90=rotate_landscape_90
             )
@@ -341,6 +367,9 @@ class ImageKdfWriter:
             layout_view,
             virtual_panel_axis,
         )
+        spread_pair_starts = set(spread_pair_starts or ())
+        if any(i < 0 or i + 1 >= len(image_paths) for i in spread_pair_starts):
+            raise ValueError("Índice de par de páginas fuera del rango de imágenes KDF.")
         self.res_dir.mkdir(exist_ok=True)
         db_path = db_path.resolve()
         parent = db_path.parent
@@ -401,7 +430,9 @@ class ImageKdfWriter:
                     else:
                         logger.info("[kdf] 彩虹纹流程 GPU 模式: off（按参数使用 CPU）")
 
-                for idx, img_path in enumerate(image_paths):
+                idx = 0
+                while idx < len(image_paths):
+                    img_path = image_paths[idx]
                     page_no = idx + 1
                     if page_no == 1 or page_no == total_pages or (page_no % progress_stride == 0):
                         logger.info(
@@ -411,13 +442,60 @@ class ImageKdfWriter:
                             (page_no * 100.0) / max(1, total_pages),
                             img_path.name,
                         )
+                    pr = preloaded_rasters[idx] if use_parallel_colorsoft else None
+                    if idx in spread_pair_starts:
+                        logger.debug(
+                            "[kdf] 写入双页 spread [%d-%d/%d]: section+resources <- %s, %s",
+                            page_no,
+                            page_no + 1,
+                            len(image_paths),
+                            img_path,
+                            image_paths[idx + 1],
+                        )
+                        if layout_view == "virtual":
+                            section_id, spm_list, res_ids, aux_ids = (
+                                self._add_facing_image_section(
+                                    [img_path, image_paths[idx + 1]],
+                                    virtual_panel_axis=virtual_panel_axis,
+                                    rotate_landscape_90=rotate_landscape_90,
+                                    erase_colorsoft_rainbow=erase_colorsoft_rainbow,
+                                    preloaded_rasters=(
+                                        [pr, preloaded_rasters[idx + 1]]
+                                        if use_parallel_colorsoft
+                                        else None
+                                    ),
+                                    rainbow_use_gpu=rainbow_use_gpu,
+                                )
+                            )
+                            authoring_aux_ids.extend(aux_ids)
+                        else:
+                            section_id, spm_list, res_ids, _ = (
+                                self._add_facing_image_section(
+                                    [img_path, image_paths[idx + 1]],
+                                    virtual_panel_axis=virtual_panel_axis,
+                                    rotate_landscape_90=rotate_landscape_90,
+                                    erase_colorsoft_rainbow=erase_colorsoft_rainbow,
+                                    preloaded_rasters=(
+                                        [pr, preloaded_rasters[idx + 1]]
+                                        if use_parallel_colorsoft
+                                        else None
+                                    ),
+                                    rainbow_use_gpu=rainbow_use_gpu,
+                                )
+                            )
+                        section_ids.append(section_id)
+                        all_structure_ids[section_id] = spm_list
+                        if idx == cover_idx or idx + 1 == cover_idx:
+                            first_cover_res = res_ids[cover_idx - idx]
+                        idx += 2
+                        continue
+
                     logger.debug(
                         "[kdf] 写入固定版式页 [%d/%d]: section+resource <- %s",
                         page_no,
                         len(image_paths),
                         img_path,
                     )
-                    pr = preloaded_rasters[idx] if use_parallel_colorsoft else None
                     if layout_view == "virtual":
                         section_id, spm_list, res_id, aux_id = (
                             self._add_virtual_panel_image_section(
@@ -442,6 +520,7 @@ class ImageKdfWriter:
                     all_structure_ids[section_id] = spm_list
                     if idx == cover_idx:
                         first_cover_res = res_id
+                    idx += 1
 
                 authoring_root_id: str | None = None
                 if layout_view == "virtual":
@@ -449,7 +528,9 @@ class ImageKdfWriter:
 
                 logger.debug("[kdf] 写入 book_metadata 与 content_features")
                 self._insert_book_metadata(
-                    first_cover_res, layout_view=layout_view
+                    first_cover_res,
+                    layout_view=layout_view,
+                    has_page_spreads=bool(spread_pair_starts),
                 )
                 logger.debug("[kdf] 写入 document_data / metadata（阅读顺序与 sections）")
                 self._create_document_data(
@@ -552,11 +633,41 @@ class ImageKdfWriter:
             ),
         )
 
+    def _add_thumbnail_resource(self, image_bytes: bytes) -> str | None:
+        """Store a page thumbnail and return its KFX resource symbol name."""
+        generated = _make_page_thumbnail(image_bytes)
+        if generated is None:
+            return None
+        thumbnail_bytes, width, height = generated
+        thumbnail_id = self.create_fragment_id("e")
+        location_id = self.create_fragment_id("rsrc")
+        if self.res_dir is not None:
+            (self.res_dir / location_id).write_bytes(thumbnail_bytes)
+
+        thumbnail_ion = f"""{{
+ format: jpg,
+ location: "{location_id}",
+ resource_width: {width},
+ resource_name: kfx_id::"{thumbnail_id}",
+ resource_height: {height}
+}}"""
+        self._insert_blob_fragment(thumbnail_id, thumbnail_ion, "external_resource")
+        self._insert_fragment_properties(
+            [
+                (thumbnail_id, "child", location_id),
+                (thumbnail_id, "element_type", "external_resource"),
+                (location_id, "element_type", "bcRawMedia"),
+            ]
+        )
+        self._insert_fragment(location_id, "blob", thumbnail_bytes)
+        return thumbnail_id
+
     def _insert_book_metadata(
         self,
         cover_res_id: str,
         *,
         layout_view: Literal["fixed", "virtual"] = "fixed",
+        has_page_spreads: bool = False,
     ) -> None:
         # 勿在 kindle_title_metadata 中写入 cde_content_type / ASIN 等：kpf_container 据此会把
         # is_kpf_prepub=False，从而跳过 fix_kpf_prepub_book（不生成 $389/$264/$265/$419/$550），
@@ -586,6 +697,18 @@ class ImageKdfWriter:
             if len(str(value)) > 0:
                 metadata.append({"key": metadata_key, "value": str(value)})
 
+        capability_metadata: list[dict[str, object]] = [
+            {"key": "yj_fixed_layout", "value": 1},
+            {
+                "key": "yj_publisher_panels",
+                "value": 0 if layout_view == "virtual" else 1,
+            },
+        ]
+        if has_page_spreads:
+            capability_metadata.append(
+                {"key": "yj_double_page_spread", "value": 1}
+            )
+
         ion = IonPyDict.from_value(
             IonType.STRUCT,
             {
@@ -599,13 +722,7 @@ class ImageKdfWriter:
                     },
                     {
                         "category": "kindle_capability_metadata",
-                        "metadata": [
-                            {"key": "yj_fixed_layout", "value": 1},
-                            {
-                                "key": "yj_publisher_panels",
-                                "value": 0 if layout_view == "virtual" else 1,
-                            },
-                        ],
+                        "metadata": capability_metadata,
                     },
                     {
                         "category": "kindle_audit_metadata",
@@ -623,11 +740,21 @@ class ImageKdfWriter:
         self._insert_fragment_property(
             "book_metadata", "element_type", "book_metadata"
         )
-        self._insert_content_features(layout_view=layout_view)
+        self._insert_content_features(
+            layout_view=layout_view, has_page_spreads=has_page_spreads
+        )
 
     def _insert_content_features(
-        self, *, layout_view: Literal["fixed", "virtual"] = "fixed"
+        self,
+        *,
+        layout_view: Literal["fixed", "virtual"] = "fixed",
+        has_page_spreads: bool = False,
     ) -> None:
+        spread_feature = """{
+ namespace: "com.amazon.yjconversion",
+ key: "yj_double_page_spread",
+ version_info: {version: {major_version: 1, minor_version: 0}}
+ },""" if has_page_spreads else ""
         if layout_view == "virtual":
             ion_text = """{
  kfx_id: content_features,
@@ -636,9 +763,15 @@ class ImageKdfWriter:
  namespace: "com.amazon.yjconversion",
  key: "yj_non_pdf_fixed_layout",
  version_info: {version: {major_version: 2, minor_version: 0}}
+ },
+__SPREAD_FEATURE__
+ {
+ namespace: "com.amazon.yjconversion",
+ key: "yj_thumbnails_present",
+ version_info: {version: {major_version: 1, minor_version: 0}}
  }
  ]
-}"""
+}""".replace("__SPREAD_FEATURE__", spread_feature)
         else:
             ion_text = """{
  kfx_id: content_features,
@@ -647,9 +780,15 @@ class ImageKdfWriter:
  namespace: "com.amazon.yjconversion",
  key: "reflow-style",
  version_info: {version: {major_version: 1, minor_version: 0}}
+ },
+__SPREAD_FEATURE__
+ {
+ namespace: "com.amazon.yjconversion",
+ key: "yj_thumbnails_present",
+ version_info: {version: {major_version: 1, minor_version: 0}}
  }
  ]
-}"""
+}""".replace("__SPREAD_FEATURE__", spread_feature)
         self._insert_blob_fragment("content_features", ion_text, "content_features")
         self._insert_fragment_property(
             "content_features", "element_type", "content_features"
@@ -675,6 +814,208 @@ class ImageKdfWriter:
         self._insert_blob_fragment(root_id, ion_text, "auxiliary_data")
         self._insert_fragment_property(root_id, "element_type", "auxiliary_data")
         return root_id
+
+    def _add_facing_image_section(
+        self,
+        image_paths: list[Path],
+        *,
+        virtual_panel_axis: Literal["vertical", "horizontal"],
+        rotate_landscape_90: bool,
+        erase_colorsoft_rainbow: bool,
+        preloaded_rasters: list[tuple[bytes, str, int, int] | None] | None,
+        rainbow_use_gpu: bool,
+    ) -> tuple[str, list[tuple[str, int]], list[str], list[str]]:
+        """Write two page images as one KDF ``page_spread`` reading section."""
+        if len(image_paths) != 2:
+            raise ValueError("Una sección page_spread requiere exactamente dos páginas.")
+        assert self.res_dir is not None
+        axis_ion = "vertical" if virtual_panel_axis == "vertical" else "horizontal"
+
+        section_id = self.create_fragment_id("c")
+        template_id = self.create_fragment_id("i")
+        story_id = self.create_fragment_id("l")
+        page_nodes: list[tuple[str, str, str, str, str, str]] = []
+        resource_ids: list[str] = []
+        aux_ids: list[str] = []
+        spm_list: list[tuple[str, int]] = [(template_id, 0)]
+
+        for page_index, image_path in enumerate(image_paths):
+            preloaded = (
+                preloaded_rasters[page_index]
+                if preloaded_rasters is not None
+                else None
+            )
+            if preloaded is None:
+                image_bytes, ion_fmt, width, height = _load_page_raster_for_kdf(
+                    image_path,
+                    rotate_landscape_90=rotate_landscape_90,
+                    erase_colorsoft_rainbow=erase_colorsoft_rainbow,
+                    rainbow_use_gpu=rainbow_use_gpu,
+                )
+            else:
+                image_bytes, ion_fmt, width, height = preloaded
+
+            outer_id = self.create_fragment_id("i")
+            inner_id = self.create_fragment_id("i")
+            image_struct_id = self.create_fragment_id("i")
+            resource_id = self.create_fragment_id("e")
+            location_id = self.create_fragment_id("rsrc")
+            aux_id = self.create_fragment_id("d")
+            thumbnail_id = self._add_thumbnail_resource(image_bytes)
+            thumbnail_field = (
+                f',\n thumbnails: kfx_id::"{thumbnail_id}"'
+                if thumbnail_id
+                else ""
+            )
+
+            (self.res_dir / location_id).write_bytes(image_bytes)
+            aux_text = f"""{{
+ kfx_id: kfx_id::"{aux_id}",
+ metadata: [
+ {{key: "location", value: {json.dumps(str(image_path.resolve()), ensure_ascii=False)}}},
+ {{key: "modified_time", value: "{int(image_path.stat().st_mtime)}"}},
+ {{key: "size", value: "{len(image_bytes)}"}},
+ {{key: "type", value: "resource"}},
+ {{key: "resource_stream", value: "{location_id}"}}
+ ]
+}}"""
+            self._insert_blob_fragment(aux_id, aux_text, "auxiliary_data")
+            self._insert_fragment_property(aux_id, "element_type", "auxiliary_data")
+
+            resource_text = f"""{{
+ format: {ion_fmt},
+ location: "{location_id}",
+ auxiliary_data: kfx_id::"{aux_id}",
+ resource_width: {width}.0e0,
+ resource_name: kfx_id::"{resource_id}",
+ resource_height: {height}.0e0{thumbnail_field}
+}}"""
+            self._insert_blob_fragment(resource_id, resource_text, "external_resource")
+            properties = [
+                (resource_id, "child", location_id),
+                (resource_id, "element_type", "external_resource"),
+                (location_id, "element_type", "bcRawMedia"),
+            ]
+            if thumbnail_id:
+                properties.append((resource_id, "child", thumbnail_id))
+            self._insert_fragment_properties(properties)
+            self._insert_fragment(location_id, "blob", image_bytes)
+
+            image_text = f"""{{
+ kfx_id: kfx_id::"{image_struct_id}",
+ width: {width},
+ resource_name: kfx_id::"{resource_id}",
+ height: {height},
+ sizing_bounds: content_bounds,
+ type: image,
+ position: fixed
+}}"""
+            self._insert_blob_fragment(image_struct_id, image_text, "structure")
+            self._insert_fragment_properties(
+                [
+                    (image_struct_id, "element_type", "structure"),
+                    (image_struct_id, "child", resource_id),
+                ]
+            )
+
+            inner_text = f"""{{
+ kfx_id: kfx_id::"{inner_id}",
+ width: {width},
+ height: {height},
+ sizing_bounds: content_bounds,
+ layout: {axis_ion},
+ type: container,
+ content_list: [kfx_id::"{image_struct_id}"]
+}}"""
+            self._insert_blob_fragment(inner_id, inner_text, "structure")
+            self._insert_fragment_properties(
+                [
+                    (inner_id, "element_type", "structure"),
+                    (inner_id, "child", image_struct_id),
+                ]
+            )
+
+            outer_text = f"""{{
+ kfx_id: kfx_id::"{outer_id}",
+ writing_mode: horizontal_tb,
+ direction: ltr,
+ font_size: 16.0e0,
+ fixed_width: {width},
+ fixed_height: {height},
+ layout: scale_fit,
+ float: center,
+ type: container,
+ content_list: [kfx_id::"{inner_id}"]
+}}"""
+            self._insert_blob_fragment(outer_id, outer_text, "structure")
+            self._insert_fragment_properties(
+                [
+                    (outer_id, "element_type", "structure"),
+                    (outer_id, "child", inner_id),
+                ]
+            )
+
+            page_nodes.append(
+                (outer_id, inner_id, image_struct_id, resource_id, location_id, aux_id)
+            )
+            resource_ids.append(resource_id)
+            aux_ids.append(aux_id)
+            spm_list.extend(
+                [
+                    (outer_id, len(spm_list)),
+                    (inner_id, len(spm_list) + 1),
+                    (image_struct_id, len(spm_list) + 2),
+                ]
+            )
+
+        panels = ",\n ".join(
+            f'kfx_id::"{outer_id}"' for outer_id, *_ in page_nodes
+        )
+        section_text = f"""{{
+ section_name: kfx_id::"{section_id}",
+ page_templates: [
+ structure::{{
+ kfx_id: kfx_id::"{template_id}",
+ story_name: kfx_id::"{story_id}",
+ virtual_panel: enabled,
+ layout: page_spread,
+ type: container
+ }}
+ ]
+}}"""
+        self._insert_blob_fragment(section_id, section_text, "section")
+        self._insert_fragment_property(section_id, "element_type", "section")
+
+        storyline_text = f"""{{
+ story_name: kfx_id::"{story_id}",
+ content_list: [{panels}]
+}}"""
+        self._insert_blob_fragment(story_id, storyline_text, "storyline")
+        storyline_properties = [
+            (story_id, "element_type", "storyline"),
+            (story_id, "child", story_id),
+        ]
+        storyline_properties.extend(
+            (story_id, "child", node[0]) for node in page_nodes
+        )
+        self._insert_fragment_properties(storyline_properties)
+
+        spm_text = (
+            f'{{section_name: kfx_id::"{section_id}", contains: '
+            f'[[{spm_list[0][1] + 1}, kfx_id::"{template_id}"], '
+            + ", ".join(
+                f'[{pid + 1}, kfx_id::"{fid}"]' for fid, pid in spm_list[1:]
+            )
+            + "]}"
+        )
+        spm_id = f"{section_id}-spm"
+        self._insert_blob_fragment(spm_id, spm_text, "section_position_id_map")
+        self._insert_fragment_property(
+            spm_id, "element_type", "section_position_id_map"
+        )
+        self._insert_section_auxiliary_data(section_id)
+
+        return section_id, spm_list, resource_ids, aux_ids
 
     def _add_virtual_panel_image_section(
         self,
@@ -764,6 +1105,10 @@ class ImageKdfWriter:
         res_loc_id = self.create_fragment_id("rsrc")
         dest = self.res_dir / res_loc_id
         dest.write_bytes(image_bytes)
+        thumbnail_id = self._add_thumbnail_resource(image_bytes)
+        thumbnail_field = (
+            f',\n thumbnails: kfx_id::"{thumbnail_id}"' if thumbnail_id else ""
+        )
 
         loc_json = json.dumps(str(image_path.resolve()), ensure_ascii=False)
         mtime_s = str(int(image_path.stat().st_mtime))
@@ -789,16 +1134,17 @@ class ImageKdfWriter:
  auxiliary_data: kfx_id::"{aux_id}",
  resource_width: {im_width}.0e0,
  resource_name: kfx_id::"{res_id}",
- resource_height: {im_height}.0e0
+ resource_height: {im_height}.0e0{thumbnail_field}
 }}"""
         self._insert_blob_fragment(res_id, res_text, "external_resource")
-        self._insert_fragment_properties(
-            [
-                (res_id, "child", res_loc_id),
-                (res_id, "element_type", "external_resource"),
-                (res_loc_id, "element_type", "bcRawMedia"),
-            ]
-        )
+        resource_properties = [
+            (res_id, "child", res_loc_id),
+            (res_id, "element_type", "external_resource"),
+            (res_loc_id, "element_type", "bcRawMedia"),
+        ]
+        if thumbnail_id:
+            resource_properties.append((res_id, "child", thumbnail_id))
+        self._insert_fragment_properties(resource_properties)
         self._insert_fragment(res_loc_id, "blob", image_bytes)
 
         struct_text = f"""{{
@@ -910,22 +1256,27 @@ class ImageKdfWriter:
         res_loc_id = self.create_fragment_id("rsrc")
         dest = self.res_dir / res_loc_id
         dest.write_bytes(image_bytes)
+        thumbnail_id = self._add_thumbnail_resource(image_bytes)
+        thumbnail_field = (
+            f',\n thumbnails: kfx_id::"{thumbnail_id}"' if thumbnail_id else ""
+        )
         # location 须为普通路径名（非 kfx_id）：kpf_fix_fragment 要求 IonString，并 fix 为 resource/<id> 与 $417 片段 fid 对齐
         res_text = f"""{{
  format: {ion_fmt},
  location: "{res_loc_id}",
  resource_width: {im_width},
  resource_name: kfx_id::"{res_id}",
- resource_height: {im_height}
+ resource_height: {im_height}{thumbnail_field}
 }}"""
         self._insert_blob_fragment(res_id, res_text, "external_resource")
-        self._insert_fragment_properties(
-            [
-                (res_id, "child", res_loc_id),
-                (res_id, "element_type", "external_resource"),
-                (res_loc_id, "element_type", "bcRawMedia"),
-            ]
-        )
+        resource_properties = [
+            (res_id, "child", res_loc_id),
+            (res_id, "element_type", "external_resource"),
+            (res_loc_id, "element_type", "bcRawMedia"),
+        ]
+        if thumbnail_id:
+            resource_properties.append((res_id, "child", thumbnail_id))
+        self._insert_fragment_properties(resource_properties)
         # 须用 blob 嵌入媒体：KPF 常仅含 book.kdf，无 zip 内 res/* 文件时 path 行无法加载，不会生成 $417，封面/内页图均丢失
         self._insert_fragment(res_loc_id, "blob", image_bytes)
 

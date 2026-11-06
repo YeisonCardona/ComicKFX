@@ -97,7 +97,7 @@ class KpfContainer(YJContainer):
                         "SQLite version 3.8.2 or later is necessary in order to use a WITHOUT ROWID table. Found version %s" %
                         sqlite3.sqlite_version)
 
-            conn = sqlite3.connect(db_filename, KpfContainer.db_timeout)
+            conn = sqlite3.connect(db_filename, timeout=KpfContainer.db_timeout)
 
         cursor = conn.cursor()
 

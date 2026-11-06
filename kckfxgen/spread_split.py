@@ -217,6 +217,80 @@ def _save_split_page(im: Image.Image, path: Path) -> None:
         im.save(path)
 
 
+def expand_landscape_pages_for_kdf(
+    images: list[Path],
+    out_dir: Path,
+    *,
+    page_order: SplitPageOrder = "right-left",
+    cover_index: int = 0,
+) -> tuple[list[Path], set[int], int]:
+    """Split landscape pages into two page images for KDF facing-spread sections.
+
+    The first/selected cover remains whole. Returned pair starts are indices in
+    the expanded image list; each points to two consecutive halves.
+    """
+    out_dir = out_dir.resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    expanded: list[Path] = []
+    pair_starts: set[int] = set()
+    expanded_cover_index = 0
+    pad = max(4, len(str(len(images) * 2 + 10)))
+
+    for index, src in enumerate(images):
+        try:
+            with Image.open(src) as source:
+                width, height = source.size
+                if index == cover_index or width <= height:
+                    if index == cover_index:
+                        expanded_cover_index = len(expanded)
+                    expanded.append(src)
+                    continue
+
+                source.load()
+                quantization = getattr(source, "quantization", None)
+                source_format = (source.format or src.suffix.lstrip(".")).lower()
+                image = source.copy()
+        except (OSError, ValueError):
+            logger.warning("No se pudo preparar la página para un spread: %s", src)
+            if index == cover_index:
+                expanded_cover_index = len(expanded)
+            expanded.append(src)
+            continue
+
+        middle = width // 2
+        left = image.crop((0, 0, middle, height))
+        right = image.crop((middle, 0, width, height))
+        if page_order == "right-left":
+            halves, tags = (right, left), ("_R", "_L")
+        else:
+            halves, tags = (left, right), ("_L", "_R")
+
+        pair_starts.add(len(expanded))
+        for half, tag in zip(halves, tags):
+            # Cropped JPEGs are re-encoded using the source quantization tables
+            # when available; PNG crops remain lossless.
+            suffix = ".png" if source_format == "png" else ".jpg"
+            target = out_dir / f"{index:0{pad}d}{tag}_{src.stem}{suffix}"
+            if suffix == ".jpg":
+                rgb = half.convert("RGB")
+                kwargs: dict[str, object] = {"optimize": True}
+                if quantization:
+                    kwargs["qtables"] = quantization
+                else:
+                    kwargs["quality"] = 95
+                rgb.save(target, "JPEG", **kwargs)
+            else:
+                half.save(target, "PNG", compress_level=3)
+            expanded.append(target)
+
+    logger.info(
+        "Preparadas %d páginas dobles como pares KDF (%d imágenes resultantes)",
+        len(pair_starts),
+        len(expanded),
+    )
+    return expanded, pair_starts, expanded_cover_index
+
+
 def _process_one_spread(
     idx: int,
     src: Path,

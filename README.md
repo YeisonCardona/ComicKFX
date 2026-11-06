@@ -122,6 +122,7 @@ python main.py path/to/comic.epub -d
 - **`page_progression`**: `"ltr"` (default) or `"rtl"`
 - **`layout_view`**: `"fixed"` (default) or `"virtual"`
 - **`virtual_panel_axis`**: `"vertical"` (default) or `"horizontal"` (when `layout_view="virtual"`)
+- **`page_spread_previews`**: `True` to split landscape pages after the cover into two ordered page images and place each pair in a KDF `page_spread` section; page crops are written to a temporary work folder
 - **`keep_kpf`**: `True` to copy the temp **`.kpf`** next to the output **`.kfx`**
 
 Run these from the **repository root**.
