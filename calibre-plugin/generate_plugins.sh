@@ -8,7 +8,7 @@ rm -f ./generate_comic_kfx.zip
 
 mkdir -p ./lib
 
-rm -rf "$HOME/Library/Preferences/calibre/plugins/_manga_kfx_libs"
+rm -rf "$HOME/Library/Preferences/calibre/plugins/_comic_kfx_libs"
 
 # 1. Install dependencies requiring Python 3.14 ARM64 binaries
 python3.14 -m pip install numpy lxml pillow --target ./lib/ \
