@@ -1,148 +1,74 @@
-# kckfxgen
+# kckfxgen - Calibre Plugin
 
-**Kindle Comics KFX Gen**
-
-**[中文版 / Chinese](README_zh.md)**
-
-Convert **EPUB** files or **comic archives** (ZIP / CBZ / RAR / CBR) to Kindle fixed-layout comic **KFX** **without Kindle Previewer**.
-
-Compared with MOBI-based comics, KFX comics usually **turn pages and load faster** with large, high-resolution artwork, and are **less likely to freeze** the device. Fixed layout keeps **pages tidy** (e.g. centered, fewer stray margins). When building the KDF, each page gets an **`orientation`** field (**portrait** / **landscape**) from the image dimensions **after applying EXIF orientation**, and book metadata declares support for **both** portrait and landscape so mixed vertical and horizontal pages behave correctly.
-
-Each successful run writes one **`书名-作者.kfx`** (sanitized title–author; collision suffixes `_2`, `_3`, …) into the chosen output directory. By default the intermediate **`.kpf`** lives only in a temp folder and is deleted; use **`--keep-kpf`** to copy a same-stem **`.kpf`** next to the **`.kfx`** for debugging or Kindle Previewer.
+This project is a fork of [kckfxgen](https://github.com/Exhen/kckfxgen). It adds several features to the original
+project and integrates its functionality into a Calibre plugin.
 
 ## Requirements
 
-- **Python 3.10+**
-- **Required (pip):** `amazon-ion`, `lxml`, `pillow`
-- **Python stdlib** `sqlite3` backed by **SQLite ≥ 3.8.2** (required for `WITHOUT ROWID` in `book.kdf`; current CPython builds on Windows/macOS/Linux satisfy this)
-- **Optional**
-  - **Double-page split** (`--split-spreads`): `numpy`, `pillow` (detect **blank centre gutter** before centre-splitting wide pages; parallel)
-  - **RAR / CBR:** `rarfile` plus a working **UnRAR** backend (extraction fails otherwise)
+- [Calibre](https://calibre-ebook.com/es/download)
+- A Kindle device (jailbreaking is not required)
+- A CBZ comic file (most importantly!)
 
-```bash
-pip install -r requirements.txt
-# Or minimal CLI-only (no numpy / rar): pip install amazon-ion lxml pillow
-```
+## Installation
 
-## GUI packaging (Windows / macOS)
+1. Download `generate_comic_kfx.zip`.
+2. Open Calibre and navigate to **Preferences > Advanced > Plugins**.
+3. Click **Load plugin from file**.
+4. Select the downloaded `.zip` file.
+5. Restart Calibre to complete the installation.
 
-- **Run locally:** `python gui.py` (tkinter).
-- **Build binaries:** PyInstaller cannot cross-compile; run `python scripts/build_gui.py` on **Windows** for `dist/kckfxgen-gui.exe` (one-file) and on **macOS** for `dist/kckfxgen-gui.app` (bundle). Optional `--zip` zips that artifact under `dist/`.
-- **CI:** Push a tag `v*` or use *Actions → Build GUI*; workflow `.github/workflows/build-gui.yml` builds both platforms and uploads zip artifacts.
+## Add to Toolbar
 
-## Supported inputs
+1. Go to **Preferences > Toolbars & menus**.
+2. Select **The main toolbar** from the left-hand column.
+3. Find **Generate Comic KFX** in the available actions.
+4. Move it to the right-hand column and place it at your preferred position.
 
-| Kind | Extensions | Notes |
-|------|------------|--------|
-| EPUB | `.epub` | Images collected from spine / manifest (unchanged behaviour) |
-| Comic archive | `.zip`, `.cbz` | Extracted with the stdlib; images ordered by **natural path sort** |
-| Comic archive | `.rar`, `.cbr` | Requires `rarfile` + UnRAR |
+## How to Use
 
-`path` may be **any single file above**, or a **directory** (recursive scan; multiple files run with a thread pool).
+1. Select one or more comics in your Calibre library.
+2. Click the **Generate Comic KFX** button.
 
-## Command-line options
+![Toolbar icon](assets/toolbar_icon.png)
 
-| Option | Description |
-|--------|-------------|
-| `path` | Input: one file (`.epub` / `.zip` / `.cbz` / `.rar` / `.cbr`) or a directory |
-| `-o` / `--output` | **Single file only:** KFX output directory (default: same folder as the input) |
-| `--output-dir` | **Batch:** write all `.kfx` files into one directory (name pattern above); cannot be combined with `-o` |
-| `-j` / `--jobs` | Worker threads (default about `min(8, CPU count)`) |
-| `-d` / `--debug` | DEBUG logging |
-| `--split-spreads` | Wide images (width ≥ height×1.25): split at the **horizontal centre** only if a **blank binding gutter** is detected; otherwise keep the full image (**off** by default) |
-| `--split-page-order` | With `--split-spreads`: `right-left` (default, right half then left) or `left-right` |
-| `--rotate-landscape-90` | Before writing KDF: rotate **landscape** pages (width > height) **90° counter‑clockwise** so they display as portrait; portrait pages unchanged |
-| `--page-progression` | KPF / KDF reading direction: `ltr` (default) or `rtl` (manga-style). Sets `book.kdf` `document_data.direction` and `book.kcb` `book_reading_direction` (**1** = LTR, **2** = RTL, aligned with Kindle Create comics) |
-| `--layout-view` | KDF page structure: **`fixed`** (default, whole-page scale) or **`virtual`** (Kindle Create–style virtual panels: `virtual_panel: enabled`, `pan_zoom`, `yj.authoring` chain, three-slot SPM, `yj_non_pdf_fixed_layout` in `content_features`) |
-| `--virtual-panel-axis` | Only when **`--layout-view virtual`**: middle container `layout` — **`vertical`** (default) or **`horizontal`** for virtual strip direction |
-| `--keep-kpf` | After a successful KFX build, also write **`同名.kpf`** in the same directory as the **`.kfx`** |
-| `--title` | Override **title** (see below for comic archives; for EPUB overrides OPF `dc:title`) |
-| `--author` | Override **author** (comic archives: parsed from filename; EPUB overrides `dc:creator`) |
-| `--publisher` | Override **publisher** (comic archives: parsed from filename; EPUB overrides `dc:publisher`) |
+A configuration window will open, allowing you to select the reading direction:
 
-### Comic archive filenames → metadata (ZIP / CBZ / RAR / CBR)
+- **LTR (Left to Right)**
+- **RTL (Right to Left)**
 
-Archives **without OPF** get `title` / `author` / `publisher` from the **stem** (filename without extension):
+![Configuration window](assets/gckfx_window.png)
 
-1. If the stem ends with **`[…]`**, the inside text is **publisher** and that suffix is removed; otherwise if it ends with **`(…)`**, that inner text is **publisher**.
-2. On what remains, if there is **` — `**, **` – `**, or **` - `** (hyphen/dash **with spaces on both sides**), split on the **first** occurrence: left = **title**, right = **author**.
-3. If there is no such separator, the whole remainder is **title**; author and publisher stay empty unless taken from brackets in step 1.
+## The Result
 
-Example: `Attack on Titan - Hajime Isayama [Kodansha].cbz` → title=`Attack on Titan`, author=`Hajime Isayama`, publisher=`Kodansha`.
+**Single-page layouts**
 
-When **batch**-processing a directory, `--title` / `--author` / `--publisher` apply **the same values to every file** found in that run (handy for uniform test batches; use per-book runs or rely on filename parsing when each book differs).
+Regular pages are displayed full-screen, without any additional margins.
 
-## Usage examples
+![Single page](assets/page_sample.png)
 
-```bash
-# Single EPUB → KFX next to the EPUB (default)
-python main.py path/to/comic.epub
+**Double-page layouts**
 
-# Single CBZ / ZIP (title/author/publisher parsed from filename; see above)
-python main.py path/to/comic.cbz
+For double-page spreads, the Kindle automatically splits the image into two halves and displays them sequentially.
 
-# Manual metadata (comic archive or EPUB)
-python main.py path/to/comic.zip --title "Custom title" --author "Some Author" --publisher "Some Press"
+<table>
+  <tr>
+    <td><img src="assets/page_left.png" alt="Left page" /></td>
+    <td><img src="assets/page_right.png" alt="Right page" /></td>
+  </tr>
+</table>
 
-# Single EPUB → KFX into a chosen directory
-python main.py path/to/comic.epub -o output_dir
+**Full-page landscape view**
 
-# Directory: recurse and convert all supported files (thread pool); default KFX next to each input
-python main.py path/to/folder
+Double-page spreads also include a popup that allows you to view the entire page in landscape orientation.
 
-# Batch: all KFX into one directory
-python main.py path/to/folder --output-dir output_dir
+![Landscape view](assets/page_landscape.png)
 
-# Thread count
-python main.py path/to/folder -j 4
 
-# Wide spreads: centre split + right-then-left (common for manga)
-python main.py path/to/comic.epub --split-spreads
 
-# After split, left page then right
-python main.py path/to/comic.zip --split-spreads --split-page-order left-right
 
-# Right-to-left page progression (manga-style; KCB + KDF)
-python main.py path/to/manga.cbz --page-progression rtl
 
-# Virtual-panel KDF (optional; default remains fixed whole-page)
-python main.py path/to/comic.cbz --layout-view virtual --virtual-panel-axis vertical
 
-# Keep intermediate .kpf beside the .kfx (e.g. for Kindle Previewer)
-python main.py path/to/comic.epub --keep-kpf
 
-# Debug log
-python main.py path/to/comic.epub -d
-```
 
-### Python API
 
-`kckfxgen.pipeline.convert_to_kfx`, `epub_to_kpf`, `comic_archive_to_kpf`, and `convert_epub_to_kfx` support:
 
-- **`page_progression`**: `"ltr"` (default) or `"rtl"`
-- **`layout_view`**: `"fixed"` (default) or `"virtual"`
-- **`virtual_panel_axis`**: `"vertical"` (default) or `"horizontal"` (when `layout_view="virtual"`)
-- **`page_spread_previews`**: `True` to split landscape pages after the cover into two ordered page images and place each pair in a KDF `page_spread` section; page crops are written to a temporary work folder
-- **`keep_kpf`**: `True` to copy the temp **`.kpf`** next to the output **`.kfx`**
-
-Run these from the **repository root**.
-
-## Inspecting `book.kdf` metadata
-
-`scripts/kdf_book_metadata_dump.py` decodes the **`book_metadata`** Ion blob to a tree or JSON (handles fingerprint-stripped KDF SQLite the same way as the writer). Example:
-
-```bash
-python scripts/kdf_book_metadata_dump.py path/to/book.kdf --json
-```
-
-## Standalone spread detector (images only)
-
-`kckfxgen/spread_split.py` can detect and split loose PNG/JPEG files without building KFX:
-
-```bash
-python -m kckfxgen.spread_split some.png -o output_dir
-# Or, from repo root (so `kckfxgen` imports):
-python src/comic_spread_split.py some.png --dry-run
-```
-
-Regression test for split logic: `python test/run_spread_split_tests.py` (expects sample images under `test/` named with `cut*` / `nocut*` prefixes).
