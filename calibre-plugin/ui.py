@@ -1,12 +1,10 @@
 import os
 import sys
 import tempfile
-import zipfile
 from pathlib import Path
 
 from calibre.gui2.actions import InterfaceAction
-from calibre.gui2 import info_dialog
-
+from calibre.gui2 import info_dialog, error_dialog
 
 from qt.core import (
     QDialog,
@@ -18,6 +16,8 @@ from qt.core import (
     QIcon,
     QPixmap,
     QGroupBox,
+    QThread,
+    pyqtSignal,
 )
 
 
@@ -29,7 +29,6 @@ class GenerateComicKFXDialog(QDialog):
         self.setWindowTitle("Generate Comic KFX")
 
         layout = QVBoxLayout(self)
-
         layout.addWidget(QLabel(text))
 
         # Read direction
@@ -37,10 +36,8 @@ class GenerateComicKFXDialog(QDialog):
         direction_layout = QVBoxLayout(direction_box)
 
         self.direction_group = QButtonGroup(self)
-
         self.rtl = QRadioButton("RTL (Right to Left, Asian comics)")
         self.rtl.setChecked(True)
-
         self.ltr = QRadioButton("LTR (Left to Right, Western comics)")
 
         self.direction_group.addButton(self.rtl)
@@ -48,7 +45,6 @@ class GenerateComicKFXDialog(QDialog):
 
         direction_layout.addWidget(self.rtl)
         direction_layout.addWidget(self.ltr)
-
         layout.addWidget(direction_box)
 
         # Content type
@@ -56,9 +52,7 @@ class GenerateComicKFXDialog(QDialog):
         content_layout = QVBoxLayout(content_box)
 
         self.content_group = QButtonGroup(self)
-
         self.pdoc = QRadioButton("PDOC (Displayed in Kindle Documents)")
-
         self.ebook = QRadioButton("EBOOK (Displayed in Kindle Books)")
         self.ebook.setChecked(True)
 
@@ -67,18 +61,69 @@ class GenerateComicKFXDialog(QDialog):
 
         content_layout.addWidget(self.ebook)
         content_layout.addWidget(self.pdoc)
-
         layout.addWidget(content_box)
 
         # Dialog buttons
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
-
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-
         layout.addWidget(buttons)
+
+
+class ComicKfxWorker(QThread):
+    progress_updated = pyqtSignal(str)
+    finished = pyqtSignal(bool, str)
+
+    def __init__(self, db, cbz_items, options, runtime_lib_path):
+        super().__init__()
+        self.db = db
+        self.cbz_items = cbz_items  # List of tuples: (book_id, cbz_path)
+        self.options = options
+        self.runtime_lib_path = runtime_lib_path
+
+    def _prepare_runtime_libraries(self):
+        if self.runtime_lib_path not in sys.path:
+            sys.path.insert(0, self.runtime_lib_path)
+
+    def run(self):
+        try:
+            self._prepare_runtime_libraries()
+            from kckfxgen.pipeline import convert_to_kfx
+
+            total = len(self.cbz_items)
+            for idx, (book_id, cbz_file) in enumerate(self.cbz_items, 1):
+                mi = self.db.get_metadata(book_id)
+                self.progress_updated.emit(f"Converting ({idx}/{total}): {mi.title}")
+
+                with tempfile.TemporaryDirectory(prefix="comic_kfx_") as tmp:
+                    tmp_path = Path(tmp)
+
+                    convert_to_kfx(
+                        Path(cbz_file),
+                        kfx_output_dir=tmp_path,
+                        page_progression=self.options["page_progression"],
+                        split_page_order=self.options["split_page_order"],
+                        page_spread_previews=True,
+                        cde_content_type=self.options["content_type"],
+                        layout_view="virtual",
+                        book_title=mi.title,
+                        book_author=", ".join(mi.authors),
+                        book_publisher=mi.publisher,
+                    )
+
+                    kfx_file = next(tmp_path.rglob("*.kfx"), None)
+                    if kfx_file:
+                        self.db.add_format(book_id, "KFX", kfx_file, replace=True)
+                    else:
+                        raise FileNotFoundError(
+                            f"No KFX file generated for '{mi.title}'."
+                        )
+
+            self.finished.emit(True, "All KFX files have been generated successfully.")
+        except Exception as e:
+            self.finished.emit(False, str(e))
 
 
 class GenerateComicKFX(InterfaceAction):
@@ -92,16 +137,12 @@ class GenerateComicKFX(InterfaceAction):
         None,
     )
 
-    def _prepare_runtime_libraries(self):
+    def _get_lib_path(self):
         plugin_dir = os.path.dirname(os.path.abspath(__file__))
-
-        # Si estamos en desarrollo por symlink o carpeta directa
         target_lib_dir = os.path.join(plugin_dir, "_comic_kfx_libs")
         real_lib_path = os.path.join(target_lib_dir, "lib")
 
-        # Si la carpeta lib local de desarrollo existe, la usamos directamente
         if not os.path.exists(real_lib_path):
-            # Fallback por si acaso se empaqueta como zip en producción
             if ".zip" in plugin_dir:
                 zip_path = plugin_dir.split(".zip")[0] + ".zip"
                 plugins_dir = os.path.dirname(zip_path)
@@ -109,13 +150,13 @@ class GenerateComicKFX(InterfaceAction):
                 real_lib_path = os.path.join(target_lib_dir, "lib")
                 if not os.path.exists(real_lib_path):
                     os.makedirs(target_lib_dir, exist_ok=True)
+                    import zipfile
+
                     with zipfile.ZipFile(zip_path, "r") as z:
                         for filename in z.namelist():
                             if filename.startswith("lib/"):
                                 z.extract(filename, target_lib_dir)
-
-        if real_lib_path not in sys.path:
-            sys.path.insert(0, real_lib_path)
+        return real_lib_path
 
     def genesis(self):
         resources = self.load_resources(["images/comic.png"])
@@ -129,9 +170,6 @@ class GenerateComicKFX(InterfaceAction):
         self.qaction.triggered.connect(self.run)
 
     def run(self):
-        self._prepare_runtime_libraries()
-        from kckfxgen.pipeline import convert_to_kfx
-
         rows = self.gui.library_view.selectionModel().selectedRows()
 
         if not rows:
@@ -140,47 +178,36 @@ class GenerateComicKFX(InterfaceAction):
             )
             return
 
-        # Obtener IDs internos
         model = self.gui.library_view.model()
         book_ids = list(map(model.id, rows))
-
-        # Utilizar la API nueva
         db = self.gui.current_db.new_api
 
-        cbz = []
-        ids = []
-        missinng = []
+        cbz_items = []
+        missing = []
 
         for book_id in book_ids:
-
-            # Metadatos
             mi = db.get_metadata(book_id)
-
-            # Formatos disponibles
             formats = db.formats(book_id)
-
-            # Rutas físicas de los formatos
-            format_paths = {}
-
-            for fmt in formats:
-                format_paths[fmt] = db.format_abspath(book_id, fmt)
+            format_paths = {fmt: db.format_abspath(book_id, fmt) for fmt in formats}
 
             if "CBZ" in format_paths:
-                cbz.append(format_paths["CBZ"])
-                ids.append(book_id)
+                cbz_items.append((book_id, format_paths["CBZ"]))
             else:
-                missinng.append(mi.title)
+                missing.append(mi.title)
 
-        if missinng:
+        if missing:
             info_dialog(
                 self.gui,
                 "Generate Comic KFX",
-                f"Missing CBZ for\n{'\n'.join(missinng)}",
+                f"Missing CBZ for:\n{'\n'.join(missing)}",
                 show=True,
             )
+            if not cbz_items:
+                return
 
+        cbz_filenames = [Path(path).name for _, path in cbz_items]
         dialog = GenerateComicKFXDialog(
-            f"The following titles will be converted into optimized KFX comic files:\n\n{'\n'.join([Path(file).name for file in cbz])}\n\n",
+            f"The following titles will be converted into optimized KFX comic files:\n\n{'\n'.join(cbz_filenames)}\n\n",
             self.gui,
         )
 
@@ -188,43 +215,36 @@ class GenerateComicKFX(InterfaceAction):
             reading_order = "RTL" if dialog.rtl.isChecked() else "LTR"
             content_type = "PDOC" if dialog.pdoc.isChecked() else "EBOOK"
 
-            if reading_order == "RTL":
-                page_progression = "rtl"
-                split_page_order = "right-left"
-            else:
-                page_progression = "ltr"
-                split_page_order = "left-right"
+            options = {
+                "page_progression": "rtl" if reading_order == "RTL" else "ltr",
+                "split_page_order": (
+                    "right-left" if reading_order == "RTL" else "left-right"
+                ),
+                "content_type": content_type,
+            }
 
-            for cbz_file, book_id in zip(cbz, ids):
+            runtime_lib_path = self._get_lib_path()
 
-                with tempfile.TemporaryDirectory(prefix="comic_kfx_") as tmp:
-                    tmp_path = Path(tmp)
+            # Disable UI action or lock interaction if desired, and start the background thread
+            self.gui.status_bar.showMessage("Preparing KFX conversion worker...")
 
-                    mi = db.get_metadata(book_id)
+            self.worker = ComicKfxWorker(db, cbz_items, options, runtime_lib_path)
+            self.worker.progress_updated.connect(self.on_progress_updated)
+            self.worker.finished.connect(self.on_finished)
+            self.worker.start()
 
-                    convert_to_kfx(
-                        Path(cbz_file),
-                        kfx_output_dir=tmp_path,
-                        page_progression=page_progression,
-                        split_page_order=split_page_order,
-                        page_spread_previews=True,
-                        cde_content_type=content_type,
-                        layout_view="virtual",
-                        book_title=mi.title,
-                        book_author=", ".join(mi.authors),
-                        book_publisher=mi.publisher,
-                    )
+    def on_progress_updated(self, message):
+        self.gui.status_bar.showMessage(message)
 
-                    kfx_file = next(tmp_path.rglob("*.kfx"), None)
-                    if kfx_file:
-                        db.add_format(book_id, "KFX", kfx_file, replace=True)
-
-                    else:
-                        raise FileNotFoundError("No KFX file was generated.")
-
-            info_dialog(
+    def on_finished(self, success, message):
+        self.gui.status_bar.clearMessage()
+        if success:
+            info_dialog(self.gui, "Generate Comic KFX", message, show=True)
+            self.gui.library_view.model().reset()
+        else:
+            error_dialog(
                 self.gui,
                 "Generate Comic KFX",
-                "All KFX files have been generated successfully.",
+                f"Conversion failed:\n{message}",
                 show=True,
             )
