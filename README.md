@@ -3,6 +3,22 @@
 This project is a fork of [kckfxgen](https://github.com/Exhen/kckfxgen). It adds several features to the original
 project and integrates its functionality into a Calibre plugin.
 
+## Why KFX?
+
+KFX is one of the best formats for reading comics on Kindle devices because it integrates directly with the native
+Kindle reader.
+
+Unlike standard image-based formats, KFX supports Kindle-specific features that provide a better reading experience and
+make full use of the device's screen.
+
+Some of its key advantages include:
+
+- **Full-screen reading:** Pages can use the entire screen without additional margins.
+- **Double-page spreads:** Wide comic pages can be automatically split into two sequential views.
+- **Landscape mode:** View complete double-page spreads in landscape orientation.
+- **Native Kindle features:** Take advantage of the reading features and interface provided by the native Kindle reader.
+- **Optimized reading experience:** Enjoy smooth navigation and seamless integration with the Kindle library.
+
 ## Requirements
 
 - [Calibre](https://calibre-ebook.com/es/download)
@@ -63,12 +79,14 @@ Double-page spreads also include a popup that allows you to view the entire page
 
 ![Landscape view](assets/page_landscape.png)
 
+## Additional KFK Features
 
+The KFX format also provides access to additional Kindle features, enhancing the reading experience.
 
-
-
-
-
-
-
+<table>
+  <tr>
+    <td><img src="assets/page_extra1.png" alt="Additional feature 1" /></td>
+    <td><img src="assets/page_extra2.png" alt="Additional feature 2" /></td>
+  </tr>
+</table>
 
