@@ -200,6 +200,8 @@ class GenerateComicKFX(InterfaceAction):
                 with tempfile.TemporaryDirectory(prefix="comic_kfx_") as tmp:
                     tmp_path = Path(tmp)
 
+                    mi = db.get_metadata(book_id)
+
                     convert_to_kfx(
                         Path(cbz_file),
                         kfx_output_dir=tmp_path,
@@ -208,6 +210,9 @@ class GenerateComicKFX(InterfaceAction):
                         page_spread_previews=True,
                         cde_content_type=content_type,
                         layout_view="virtual",
+                        book_title=mi.title,
+                        book_author=", ".join(mi.authors),
+                        book_publisher=mi.publisher,
                     )
 
                     kfx_file = next(tmp_path.rglob("*.kfx"), None)
