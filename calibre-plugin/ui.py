@@ -186,7 +186,7 @@ class GenerateComicKFX(InterfaceAction):
 
         if dialog.exec() == QDialog.DialogCode.Accepted:
             reading_order = "RTL" if dialog.rtl.isChecked() else "LTR"
-            content_type = "PDOC" if self.pdoc.isChecked() else "EBOOK"
+            content_type = "PDOC" if dialog.pdoc.isChecked() else "EBOOK"
 
             if reading_order == "RTL":
                 page_progression = "rtl"
@@ -206,7 +206,7 @@ class GenerateComicKFX(InterfaceAction):
                         page_progression=page_progression,
                         split_page_order=split_page_order,
                         page_spread_previews=True,
-                        content_type=content_type,
+                        cde_content_type=content_type,
                         layout_view="virtual",
                     )
 
