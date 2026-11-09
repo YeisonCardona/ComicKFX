@@ -1,7 +1,12 @@
-# kckfxgen - Calibre Plugin
+# ComicKFX
 
-This project is a fork of [kckfxgen](https://github.com/Exhen/kckfxgen). It adds several features to the original
-project and integrates its functionality into a Calibre plugin.
+A Calibre plugin for generating Kindle-optimized KFX files from CBZ comics.
+
+ComicKFX integrates comic-to-KFX conversion directly into Calibre, providing optimized layouts, double-page splitting,
+configurable reading direction, and native Kindle reading features.
+
+This project is based on [kckfxgen](https://github.com/Exhen/kckfxgen), with additional features and a dedicated Calibre
+plugin interface.
 
 ## Why KFX?
 
